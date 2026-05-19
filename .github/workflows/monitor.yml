@@ -1,0 +1,60 @@
+name: Review Monitor
+
+on:
+  schedule:
+    - cron: '45 */2 * * *'   # Jalan setiap 2 jam, 30 menit setelah scraper utama
+  workflow_dispatch:           # Bisa dijalankan manual
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install playwright
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Restore seen_reviews cache
+        uses: actions/cache@v4
+        with:
+          path: seen_reviews.json
+          key: seen-reviews-${{ github.run_id }}
+          restore-keys: |
+            seen-reviews-
+
+      - name: Run Review Monitor
+        env:
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: python review_monitor.py
+
+      - name: Commit results
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add bad_reviews.json seen_reviews.json monitor_log.txt || true
+          git diff --cached --quiet || git commit -m "chore: update bad reviews [skip ci]"
+          git push || true
+
+      - name: Upload log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitor-log-${{ github.run_number }}
+          path: |
+            monitor_log.txt
+            bad_reviews.json
+          retention-days: 7
