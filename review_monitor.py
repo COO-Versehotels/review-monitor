@@ -2,6 +2,7 @@
 review_monitor.py
 Scraper bad reviews (bintang 1-3) dari Booking.com dan Agoda
 untuk 4 hotel Verse Hotels Group
+v2 - improved selectors + debug output
 """
 
 import json
@@ -18,8 +19,9 @@ from playwright.sync_api import sync_playwright
 BAD_REVIEW_FILE  = "bad_reviews.json"
 PREV_SEEN_FILE   = "seen_reviews.json"
 LOG_FILE         = "monitor_log.txt"
-MAX_REVIEWS_PER  = 10   # Ambil maksimal 10 review terbaru per hotel per platform
-BAD_STAR_MAX     = 3    # Bintang 1, 2, 3 dianggap bad review
+DEBUG_FILE       = "debug_cards.txt"
+MAX_REVIEWS_PER  = 10
+BAD_STAR_MAX     = 3
 
 NOTIFY_EMAIL     = "coo.versehotels@gmail.com"
 SENDER_EMAIL     = "coo.versehotels@gmail.com"
@@ -55,6 +57,21 @@ def log(msg):
     except Exception:
         pass
 
+def debug_write(hotel, platform, card_index, raw_text, raw_html=""):
+    try:
+        with open(DEBUG_FILE, "a", encoding="utf-8") as f:
+            f.write("=" * 80 + "\n")
+            f.write(f"HOTEL: {hotel} | PLATFORM: {platform} | CARD #{card_index}\n")
+            f.write("-" * 40 + "\n")
+            f.write("TEXT:\n")
+            f.write((raw_text or "(empty)")[:1500])
+            f.write("\n" + "-" * 40 + "\n")
+            f.write("HTML:\n")
+            f.write((raw_html or "(empty)")[:1500])
+            f.write("\n\n")
+    except Exception:
+        pass
+
 def load_json(path, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -67,7 +84,6 @@ def save_json(path, data):
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 def make_review_id(hotel, platform, reviewer, comment):
-    """Buat ID unik untuk setiap review agar tidak duplikat"""
     raw = f"{hotel}|{platform}|{reviewer}|{comment[:50]}"
     return str(abs(hash(raw)))
 
@@ -76,103 +92,171 @@ def normalize(text):
         return ""
     return re.sub(r"\s+", " ", str(text)).strip()
 
+def extract_star_from_text(text):
+    """Coba baca bintang/score dari teks"""
+    if not text:
+        return None, None
+    # Format X/10
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*/\s*10", text)
+    if m:
+        try:
+            score = float(m.group(1).replace(",", "."))
+            return round(score / 2), score
+        except Exception:
+            pass
+    # Format X/5
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*/\s*5", text)
+    if m:
+        try:
+            score = float(m.group(1).replace(",", "."))
+            if 1 <= score <= 5:
+                return int(round(score)), score
+        except Exception:
+            pass
+    # Angka tunggal
+    m = re.search(r"\b(\d(?:[.,]\d)?)\b", text)
+    if m:
+        try:
+            score = float(m.group(1).replace(",", "."))
+            if 1 <= score <= 5:
+                return int(round(score)), score
+            elif 2 <= score <= 10:
+                return round(score / 2), score
+        except Exception:
+            pass
+    return None, None
+
 # ── Scraper Booking.com ──────────────────────────────────────
 def scrape_booking_reviews(page, hotel_name, url):
     results = []
     try:
-        log(f"  Booking.com → {hotel_name}")
+        log(f"  Booking.com -> {hotel_name}")
         page.goto(url, timeout=60000, wait_until="domcontentloaded")
-        page.wait_for_timeout(5000)
+        page.wait_for_timeout(6000)
 
-        # Klik filter "Negatif" jika ada
-        try:
-            neg_btn = page.query_selector('button[data-testid="review-score-filter-negative"]')
-            if not neg_btn:
-                neg_btn = page.query_selector('a:has-text("Negatif"), a:has-text("Negative"), button:has-text("Negatif")')
-            if neg_btn:
-                neg_btn.click()
-                page.wait_for_timeout(3000)
-        except Exception:
-            pass
-
-        # Scroll untuk load review
-        for pos in [500, 1000, 1500, 2000, 2500]:
+        for pos in [300, 800, 1400, 2000, 2800, 3500]:
             try:
                 page.evaluate(f"window.scrollTo(0, {pos})")
-                page.wait_for_timeout(800)
+                page.wait_for_timeout(500)
             except Exception:
                 pass
 
-        # Extract review cards
-        review_cards = page.query_selector_all('[data-testid="review-card"], .c-review-block, .review_list_new_item_block')
+        selectors = [
+            '[data-testid="review-card"]',
+            '.c-review-block',
+            '.review_list_new_item_block',
+            '.review_item',
+            '[class*="ReviewCard"]',
+            '[class*="review-card"]',
+            'li[data-review-id]',
+        ]
+
+        review_cards = []
+        used_sel = ""
+        for sel in selectors:
+            cards = page.query_selector_all(sel)
+            if cards:
+                log(f"    Selector '{sel}' -> {len(cards)} cards")
+                review_cards = cards
+                used_sel = sel
+                break
+
         if not review_cards:
-            review_cards = page.query_selector_all('.review_item, [class*="review"]')
+            log(f"    Tidak ada card — simpan page text ke debug")
+            full_text = normalize(page.inner_text("body"))
+            debug_write(hotel_name, "Booking.com", 0, full_text[:3000])
+            return results
 
-        log(f"    Ditemukan {len(review_cards)} review cards")
-
-        for card in review_cards[:MAX_REVIEWS_PER]:
+        for i, card in enumerate(review_cards[:MAX_REVIEWS_PER]):
             try:
-                # Rating/score
-                score_el = card.query_selector('[data-testid="review-score"], .bui-review-score__badge, .review-score-badge')
-                score_text = normalize(score_el.inner_text()) if score_el else ""
+                raw_text = normalize(card.inner_text())
+                raw_html = card.inner_html()
+                debug_write(hotel_name, "Booking.com", i+1, raw_text, raw_html[:800])
+
+                star = None
                 score = None
-                m = re.search(r"(\d+[.,]\d+|\d+)", score_text)
-                if m:
-                    try:
-                        score = float(m.group(1).replace(",", "."))
-                        # Booking pakai skala 10, konversi ke bintang 1-5
-                        star = round(score / 2)
-                    except Exception:
-                        star = None
-                else:
-                    star = None
 
-                # Kalau tidak ada score, cek elemen bintang
+                # Method 1: data-testid
+                for sel in ['[data-testid="review-score"]', '[data-testid="review-score-badge"]']:
+                    el = card.query_selector(sel)
+                    if el:
+                        star, score = extract_star_from_text(normalize(el.inner_text()))
+                        if star:
+                            break
+
+                # Method 2: class-based
                 if star is None:
-                    star_els = card.query_selector_all('.bk-icon-stars-filled, [class*="star-filled"]')
-                    star = len(star_els) if star_els else None
+                    for cls in ['bui-review-score__badge', 'review-score-badge',
+                                'bui-score', 'c-score', 'score-badge']:
+                        el = card.query_selector(f'[class*="{cls}"]')
+                        if el:
+                            star, score = extract_star_from_text(normalize(el.inner_text()))
+                            if star:
+                                break
 
-                # Reviewer name
-                name_el = card.query_selector('[data-testid="review-author"], .bui-avatar-block__title, .reviewer_name')
-                reviewer = normalize(name_el.inner_text()) if name_el else "Tamu"
+                # Method 3: count filled stars
+                if star is None:
+                    for star_sel in ['[class*="star"][class*="fill"]',
+                                     'svg[aria-label*="star"]',
+                                     '[class*="filled"]']:
+                        els = card.query_selector_all(star_sel)
+                        if els:
+                            star = len(els)
+                            break
 
-                # Komentar negatif
-                neg_el = card.query_selector('[data-testid="review-negative"], .review_neg, .c-review__body--negative')
-                neg_text = normalize(neg_el.inner_text()) if neg_el else ""
+                # Method 4: regex dari raw text
+                if star is None:
+                    star, score = extract_star_from_text(raw_text[:300])
 
-                # Komentar positif (fallback)
-                pos_el = card.query_selector('[data-testid="review-positive"], .review_pos, .c-review__body--positive')
-                pos_text = normalize(pos_el.inner_text()) if pos_el else ""
+                log(f"    Card #{i+1}: star={star} score={score} | {raw_text[:70]}")
 
-                comment = neg_text or pos_text
+                reviewer = "Tamu"
+                for sel in ['[data-testid="review-author"]', '.bui-avatar-block__title',
+                            '.reviewer_name', '[class*="reviewer-name"]']:
+                    el = card.query_selector(sel)
+                    if el:
+                        t = normalize(el.inner_text())
+                        if t:
+                            reviewer = t
+                            break
+
+                comment = ""
+                for sel in ['[data-testid="review-negative"]', '[data-testid="review-body"]',
+                            '.review_neg', '[class*="review-body"]', '[class*="ReviewBody"]']:
+                    el = card.query_selector(sel)
+                    if el:
+                        t = normalize(el.inner_text())
+                        if t:
+                            comment = t
+                            break
                 if not comment:
-                    body_el = card.query_selector('.review_body, [class*="review-body"]')
-                    comment = normalize(body_el.inner_text()) if body_el else ""
+                    comment = raw_text[:300]
 
-                # Tanggal
-                date_el = card.query_selector('[data-testid="review-date"], .c-review-block__date, .review_item_date')
-                date_text = normalize(date_el.inner_text()) if date_el else ""
+                date_text = ""
+                for sel in ['[data-testid="review-date"]', '.c-review-block__date',
+                            '[class*="review-date"]', '[class*="ReviewDate"]']:
+                    el = card.query_selector(sel)
+                    if el:
+                        t = normalize(el.inner_text())
+                        if t:
+                            date_text = t
+                            break
 
-                if star and star <= BAD_STAR_MAX and comment:
+                if star and 1 <= star <= BAD_STAR_MAX:
                     results.append({
-                        "hotel":     hotel_name,
-                        "platform":  "Booking.com",
-                        "reviewer":  reviewer,
-                        "star":      star,
-                        "score":     score,
-                        "comment":   comment[:300],
-                        "date":      date_text,
-                        "url":       url,
+                        "hotel": hotel_name, "platform": "Booking.com",
+                        "reviewer": reviewer, "star": star, "score": score,
+                        "comment": comment[:300], "date": date_text, "url": url,
                     })
+                    log(f"    BAD REVIEW FOUND: {reviewer} | bintang={star} | {comment[:60]}")
 
             except Exception as e:
-                log(f"    Error card: {str(e)[:60]}")
-                continue
+                log(f"    Error card #{i+1}: {str(e)[:80]}")
 
     except Exception as e:
-        log(f"  ERROR Booking.com {hotel_name}: {str(e)[:80]}")
+        log(f"  ERROR Booking {hotel_name}: {str(e)[:100]}")
 
-    log(f"    Bad reviews ditemukan: {len(results)}")
+    log(f"    Bad reviews: {len(results)}")
     return results
 
 
@@ -180,94 +264,112 @@ def scrape_booking_reviews(page, hotel_name, url):
 def scrape_agoda_reviews(page, hotel_name, url):
     results = []
     try:
-        log(f"  Agoda → {hotel_name}")
+        log(f"  Agoda -> {hotel_name}")
         page.goto(url, timeout=60000, wait_until="domcontentloaded")
-        page.wait_for_timeout(5000)
+        page.wait_for_timeout(6000)
 
-        # Coba filter review negatif / sort by lowest
-        try:
-            sort_els = page.query_selector_all('select[name*="sort"], [class*="sort"] option, button:has-text("Sort")')
-            # Cari opsi "Lowest rated" atau "Paling rendah"
-            lowest = page.query_selector('option:has-text("Lowest"), option:has-text("Paling rendah"), option:has-text("Terendah")')
-            if lowest:
-                lowest.click()
-                page.wait_for_timeout(2000)
-        except Exception:
-            pass
-
-        # Scroll
-        for pos in [500, 1000, 1500, 2000, 2500, 3000]:
+        for pos in [500, 1200, 2000, 3000, 4000]:
             try:
                 page.evaluate(f"window.scrollTo(0, {pos})")
-                page.wait_for_timeout(700)
+                page.wait_for_timeout(600)
             except Exception:
                 pass
 
-        # Extract review items
-        review_cards = page.query_selector_all('[class*="ReviewItem"], [class*="review-item"], [data-element-name="review-card"]')
+        selectors = [
+            '[data-selenium="review-item"]',
+            '[class*="ReviewItem"]',
+            '[class*="review-item"]',
+            '[data-element-name="review-card"]',
+            '.review-comment',
+            '[class*="Review_"]',
+        ]
+
+        review_cards = []
+        for sel in selectors:
+            cards = page.query_selector_all(sel)
+            if cards:
+                log(f"    Selector '{sel}' -> {len(cards)} cards")
+                review_cards = cards
+                break
+
         if not review_cards:
-            review_cards = page.query_selector_all('[class*="Review_"], [class*="reviewCard"]')
+            log(f"    Tidak ada card — simpan page text ke debug")
+            full_text = normalize(page.inner_text("body"))
+            debug_write(hotel_name, "Agoda", 0, full_text[:3000])
+            return results
 
-        log(f"    Ditemukan {len(review_cards)} review cards")
-
-        for card in review_cards[:MAX_REVIEWS_PER]:
+        for i, card in enumerate(review_cards[:MAX_REVIEWS_PER]):
             try:
-                # Rating (Agoda pakai skala 10)
-                score_el = card.query_selector('[class*="score"], [class*="Score"], [class*="rating"], [class*="Rating"]')
-                score_text = normalize(score_el.inner_text()) if score_el else ""
-                score = None
+                raw_text = normalize(card.inner_text())
+                raw_html = card.inner_html()
+                debug_write(hotel_name, "Agoda", i+1, raw_text, raw_html[:800])
+
                 star = None
-                m = re.search(r"(\d+[.,]\d+|\d+)", score_text)
-                if m:
-                    try:
-                        score = float(m.group(1).replace(",", "."))
-                        if score <= 10:
-                            star = round(score / 2)
-                        else:
-                            star = None
-                    except Exception:
-                        pass
+                score = None
 
-                # Reviewer name
-                name_el = card.query_selector('[class*="reviewer"], [class*="Reviewer"], [class*="name"], [class*="Name"]')
-                reviewer = normalize(name_el.inner_text()) if name_el else "Tamu"
+                for sel in ['[data-selenium="review-score"]', '[class*="score"]',
+                            '[class*="Score"]', '[class*="rating"]', '[class*="Rating"]']:
+                    el = card.query_selector(sel)
+                    if el:
+                        star, score = extract_star_from_text(normalize(el.inner_text()))
+                        if star:
+                            break
 
-                # Komentar
-                comment_el = card.query_selector('[class*="comment"], [class*="Comment"], [class*="text"], [class*="Text"], [class*="body"]')
-                comment = normalize(comment_el.inner_text()) if comment_el else ""
+                if star is None:
+                    star, score = extract_star_from_text(raw_text[:200])
 
-                # Fallback: ambil semua teks dari card
+                log(f"    Card #{i+1}: star={star} score={score} | {raw_text[:70]}")
+
+                reviewer = "Tamu"
+                for sel in ['[data-selenium="reviewer-name"]', '[class*="reviewer"]',
+                            '[class*="Reviewer"]', '[class*="traveler"]']:
+                    el = card.query_selector(sel)
+                    if el:
+                        t = normalize(el.inner_text())
+                        if t:
+                            reviewer = t
+                            break
+
+                comment = ""
+                for sel in ['[data-selenium="review-comment"]', '[class*="comment"]',
+                            '[class*="Comment"]', '[class*="review-text"]', '[class*="body"]']:
+                    el = card.query_selector(sel)
+                    if el:
+                        t = normalize(el.inner_text())
+                        if t:
+                            comment = t
+                            break
                 if not comment:
-                    comment = normalize(card.inner_text())[:300]
+                    comment = raw_text[:300]
 
-                # Tanggal
-                date_el = card.query_selector('[class*="date"], [class*="Date"]')
-                date_text = normalize(date_el.inner_text()) if date_el else ""
+                date_text = ""
+                for sel in ['[data-selenium="review-date"]', '[class*="date"]', '[class*="Date"]']:
+                    el = card.query_selector(sel)
+                    if el:
+                        t = normalize(el.inner_text())
+                        if t:
+                            date_text = t
+                            break
 
-                if star and star <= BAD_STAR_MAX and comment:
+                if star and 1 <= star <= BAD_STAR_MAX:
                     results.append({
-                        "hotel":     hotel_name,
-                        "platform":  "Agoda",
-                        "reviewer":  reviewer,
-                        "star":      star,
-                        "score":     score,
-                        "comment":   comment[:300],
-                        "date":      date_text,
-                        "url":       url,
+                        "hotel": hotel_name, "platform": "Agoda",
+                        "reviewer": reviewer, "star": star, "score": score,
+                        "comment": comment[:300], "date": date_text, "url": url,
                     })
+                    log(f"    BAD REVIEW FOUND: {reviewer} | bintang={star} | {comment[:60]}")
 
             except Exception as e:
-                log(f"    Error card: {str(e)[:60]}")
-                continue
+                log(f"    Error card #{i+1}: {str(e)[:80]}")
 
     except Exception as e:
-        log(f"  ERROR Agoda {hotel_name}: {str(e)[:80]}")
+        log(f"  ERROR Agoda {hotel_name}: {str(e)[:100]}")
 
-    log(f"    Bad reviews ditemukan: {len(results)}")
+    log(f"    Bad reviews: {len(results)}")
     return results
 
 
-# ── Filter review baru (belum pernah dikirim) ────────────────
+# ── Filter baru ──────────────────────────────────────────────
 def filter_new_reviews(all_reviews, seen):
     new_reviews = []
     for r in all_reviews:
@@ -280,28 +382,25 @@ def filter_new_reviews(all_reviews, seen):
 
 # ── Kirim Email ──────────────────────────────────────────────
 def send_email(new_reviews):
-    if not new_reviews:
-        return
-    if not SENDER_PASSWORD:
-        log("ERROR: GMAIL_APP_PASSWORD tidak ditemukan di environment!")
+    if not new_reviews or not SENDER_PASSWORD:
+        if not SENDER_PASSWORD:
+            log("ERROR: GMAIL_APP_PASSWORD tidak ditemukan!")
         return
 
     total = len(new_reviews)
     hotels_affected = list(set(r["hotel"] for r in new_reviews))
+    subject = f"ALERT: {total} Bad Review Baru — Verse Hotels ({datetime.now().strftime('%d %b %Y %H:%M')} WIB)"
 
-    subject = f"⚠️ ALERT: {total} Bad Review Baru — Verse Hotels ({datetime.now().strftime('%d %b %Y %H:%M')} WIB)"
-
-    # Build HTML email
     rows_html = ""
     for r in new_reviews:
-        stars = "⭐" * r["star"] if r.get("star") else "—"
+        stars = "★" * int(r["star"]) if r.get("star") else "—"
         rows_html += f"""
         <tr>
             <td style="padding:10px;border:1px solid #ddd;font-weight:bold">{r['hotel']}</td>
             <td style="padding:10px;border:1px solid #ddd">{r['platform']}</td>
-            <td style="padding:10px;border:1px solid #ddd;color:#e74c3c">{stars} ({r.get('score','—')})</td>
+            <td style="padding:10px;border:1px solid #ddd;color:#e74c3c;font-size:18px">{stars}</td>
             <td style="padding:10px;border:1px solid #ddd">{r.get('reviewer','—')}</td>
-            <td style="padding:10px;border:1px solid #ddd;font-style:italic">"{r['comment'][:200]}..."</td>
+            <td style="padding:10px;border:1px solid #ddd;font-style:italic">"{r['comment'][:200]}"</td>
             <td style="padding:10px;border:1px solid #ddd;font-size:12px">{r.get('date','—')}</td>
         </tr>"""
 
@@ -329,12 +428,10 @@ def send_email(new_reviews):
             <tbody>{rows_html}</tbody>
         </table>
         <div style="margin-top:20px;padding:15px;background:#f8f9fa;border-radius:4px;font-size:12px;color:#666">
-            Email ini dikirim otomatis oleh sistem Review Monitor — Verse Hotels Group<br>
-            Scraping dilakukan setiap 2 jam sekali.
+            Email otomatis — Review Monitor Verse Hotels Group
         </div>
     </div>
-    </body></html>
-    """
+    </body></html>"""
 
     try:
         msg = MIMEMultipart("alternative")
@@ -342,20 +439,24 @@ def send_email(new_reviews):
         msg["From"]    = SENDER_EMAIL
         msg["To"]      = NOTIFY_EMAIL
         msg.attach(MIMEText(html_body, "html"))
-
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
             server.sendmail(SENDER_EMAIL, NOTIFY_EMAIL, msg.as_string())
-
-        log(f"✅ Email terkirim ke {NOTIFY_EMAIL} — {total} bad review")
+        log(f"Email terkirim -> {total} bad review")
     except Exception as e:
         log(f"ERROR kirim email: {str(e)}")
 
 
 # ── Main ─────────────────────────────────────────────────────
 def main():
+    try:
+        with open(DEBUG_FILE, "w", encoding="utf-8") as f:
+            f.write(f"# DEBUG CARDS — {datetime.now()}\n\n")
+    except Exception:
+        pass
+
     log("=" * 60)
-    log("REVIEW MONITOR — START")
+    log("REVIEW MONITOR v2 — START")
     log("=" * 60)
 
     seen = load_json(PREV_SEEN_FILE, {})
@@ -380,65 +481,44 @@ def main():
             window.chrome = {runtime: {}};
         """)
         page = context.new_page()
-        page.set_extra_http_headers({
-            "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
-        })
+        page.set_extra_http_headers({"Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7"})
 
         for hotel_name, sources in HOTELS.items():
             log(f"\nHotel: {hotel_name}")
-
-            # Booking.com
-            booking_reviews = scrape_booking_reviews(page, hotel_name, sources["booking"])
-            all_bad_reviews.extend(booking_reviews)
-            time.sleep(5)
-
-            # Agoda
-            agoda_reviews = scrape_agoda_reviews(page, hotel_name, sources["agoda"])
-            all_bad_reviews.extend(agoda_reviews)
-            time.sleep(5)
+            all_bad_reviews.extend(scrape_booking_reviews(page, hotel_name, sources["booking"]))
+            time.sleep(4)
+            all_bad_reviews.extend(scrape_agoda_reviews(page, hotel_name, sources["agoda"]))
+            time.sleep(4)
 
         context.close()
         browser.close()
 
-    # Filter hanya review baru
     new_reviews = filter_new_reviews(all_bad_reviews, seen)
-    log(f"\nTotal bad reviews ditemukan : {len(all_bad_reviews)}")
-    log(f"Bad reviews BARU (belum dikirim): {len(new_reviews)}")
+    log(f"\nTotal bad reviews : {len(all_bad_reviews)}")
+    log(f"Bad reviews BARU  : {len(new_reviews)}")
 
-    # Update seen reviews
     for r in new_reviews:
-        seen[r["_id"]] = {
-            "hotel":    r["hotel"],
-            "platform": r["platform"],
-            "date":     r.get("date", ""),
-            "seen_at":  str(datetime.now()),
-        }
-
-    # Batasi seen tidak terlalu besar (simpan 500 terakhir)
+        seen[r["_id"]] = {"hotel": r["hotel"], "platform": r["platform"], "seen_at": str(datetime.now())}
     if len(seen) > 500:
         keys = list(seen.keys())
-        for old_key in keys[:-500]:
-            del seen[old_key]
+        for k in keys[:-500]:
+            del seen[k]
 
     save_json(PREV_SEEN_FILE, seen)
-
-    # Simpan semua bad reviews ke file
-    output = {
+    save_json(BAD_REVIEW_FILE, {
         "last_update": str(datetime.now()),
         "total_bad_reviews": len(all_bad_reviews),
         "new_this_run": len(new_reviews),
         "bad_reviews": all_bad_reviews,
         "new_reviews": new_reviews,
-    }
-    save_json(BAD_REVIEW_FILE, output)
+    })
 
-    # Kirim email kalau ada yang baru
     if new_reviews:
         send_email(new_reviews)
     else:
         log("Tidak ada bad review baru — email tidak dikirim")
 
-    log("\nREVIEW MONITOR — SELESAI")
+    log("\nREVIEW MONITOR v2 — SELESAI")
 
 
 if __name__ == "__main__":

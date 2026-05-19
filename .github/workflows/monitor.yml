@@ -2,8 +2,8 @@ name: Review Monitor
 
 on:
   schedule:
-    - cron: '45 */2 * * *'   # Jalan setiap 2 jam, 30 menit setelah scraper utama
-  workflow_dispatch:           # Bisa dijalankan manual
+    - cron: '45 */2 * * *'
+  workflow_dispatch:
 
 jobs:
   monitor:
@@ -45,11 +45,11 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add bad_reviews.json seen_reviews.json monitor_log.txt || true
+          git add bad_reviews.json seen_reviews.json monitor_log.txt debug_cards.txt || true
           git diff --cached --quiet || git commit -m "chore: update bad reviews [skip ci]"
           git push || true
 
-      - name: Upload log artifact
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -57,4 +57,5 @@ jobs:
           path: |
             monitor_log.txt
             bad_reviews.json
+            debug_cards.txt
           retention-days: 7
